@@ -355,4 +355,5 @@ Proyecto academico - Materia: Procesamiento de Imagenes
 
 ISSD: Inteligencia Artificial y Ciencia de Datos - Año 2025
 #   p i m - f i n a l - l o c a l h o s t  
+ #   p i m - f i n a l - l o c a l h o s t  
  
