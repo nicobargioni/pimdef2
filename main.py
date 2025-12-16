@@ -1,208 +1,278 @@
 # === Importación de librerías ===
-import streamlit as st                           # Interfaz web interactiva
-import cv2                                       # Procesamiento de imágenes con OpenCV
-import numpy as np                               # Cálculos numéricos
-import time                                      # Medición de tiempo
-from collections import deque                    # Estructura para guardar historial de atención
-import mediapipe as mp                           # Librería de visión por computadora en tiempo real
+import streamlit as st
+import cv2
+import numpy as np
+import time
+from collections import deque
+import mediapipe as mp
+import threading
+import av
+
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
 # === Importación de módulos personalizados ===
 from detector import evaluar_atencion, dibujar_landmarks
 from segmentacion import detectar_presencia_persona, aplicar_mascara_segmentacion
 from graficos import graficar_atencion
 
-# ---------- Estado inicial ----------
-# Inicialización de variables persistentes entre ciclos (usando session_state)
-if "running" not in st.session_state:
-    st.session_state.running = False              # Indica si está en modo monitoreo
-    st.session_state.cap = None                   # Cámara de video
-    st.session_state.face_mesh = None             # Modelo de detección facial
-    st.session_state.segmentador = None           # Modelo de segmentación semántica
-    st.session_state.ventana_atencion = deque(maxlen=100)   # Buffer con últimos niveles de atención
-    st.session_state.x_vals = deque(maxlen=100)             # Buffer con los números de frame
-    st.session_state.total_frames = 0             # Conteo de todos los frames procesados
-    st.session_state.atencion_frames = 0          # Conteo de frames con atención detectada
-    st.session_state.start_time = None            # Tiempo de inicio del monitoreo
-    st.session_state.last_report_time = 0         # Último timestamp en que se actualizó el sidebar
-    st.session_state.attention_log = []           # Historial completo del índice de atención
+# Configuración para servidores TURN/STUN (necesario para cloud)
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
+# ---------- Estado compartido (thread-safe) ----------
+class AttentionState:
+    """Clase para manejar estado compartido entre threads de forma segura."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.total_frames = 0
+        self.atencion_frames = 0
+        self.ventana_atencion = deque(maxlen=100)
+        self.x_vals = deque(maxlen=100)
+        self.attention_log = []
+        self.last_attention_index = 0
+        self.start_time = None
+
+    def reset(self):
+        with self.lock:
+            self.total_frames = 0
+            self.atencion_frames = 0
+            self.ventana_atencion.clear()
+            self.x_vals.clear()
+            self.attention_log.clear()
+            self.last_attention_index = 0
+            self.start_time = time.time()
+
+    def update(self, is_attentive):
+        with self.lock:
+            self.total_frames += 1
+            if is_attentive:
+                self.atencion_frames += 1
+
+            if self.total_frames > 0:
+                atencion_index = int((self.atencion_frames / self.total_frames) * 100)
+                self.last_attention_index = atencion_index
+                self.ventana_atencion.append(atencion_index)
+                self.x_vals.append(self.total_frames)
+                self.attention_log.append(atencion_index)
+
+    def get_stats(self):
+        with self.lock:
+            return {
+                'total_frames': self.total_frames,
+                'atencion_frames': self.atencion_frames,
+                'attention_index': self.last_attention_index,
+                'ventana_atencion': list(self.ventana_atencion),
+                'x_vals': list(self.x_vals),
+                'attention_log': list(self.attention_log),
+                'start_time': self.start_time
+            }
+
+# Inicializar estado global
+if 'attention_state' not in st.session_state:
+    st.session_state.attention_state = AttentionState()
+
+# ---------- Procesador de Video ----------
+class AttentionVideoProcessor:
+    """Procesador de video que analiza la atención en cada frame."""
+
+    def __init__(self):
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.segmentador = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
+
+        # Configuración (se actualiza desde la UI)
+        self.umbral_giro_izquierda = 0.4
+        self.umbral_giro_derecha = 0.6
+        self.umbral_ojos_y_baja = 0.25
+        self.mostrar_landmarks = True
+        self.usar_segmentacion = True
+        self.ver_mascara_segmentacion = True
+
+        # Referencia al estado compartido
+        self.state = None
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        img = cv2.flip(img, 1)  # Espejo horizontal
+
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+        segment = self.segmentador.process(rgb)
+        h, w, _ = img.shape
+
+        score = 0
+        hay_persona = True
+        texto = "Sin rostro"
+        color = (150, 150, 255)
+        is_attentive = False
+
+        # Validación de persona real
+        if self.usar_segmentacion:
+            hay_persona = detectar_presencia_persona(segment.segmentation_mask)
+
+        # Procesamiento facial
+        if hay_persona and results.multi_face_landmarks:
+            for rostro in results.multi_face_landmarks:
+                if self.mostrar_landmarks:
+                    img = dibujar_landmarks(img, rostro)
+
+                score, _ = evaluar_atencion(
+                    rostro, w, h,
+                    self.umbral_giro_izquierda,
+                    self.umbral_giro_derecha,
+                    self.umbral_ojos_y_baja
+                )
+
+            if score >= 0.7:
+                is_attentive = True
+                texto = "ATENTO"
+                color = (0, 255, 0)
+            else:
+                texto = "NO ATENTO"
+                color = (0, 0, 255)
+        elif not hay_persona:
+            texto = "Sin persona detectada"
+            color = (150, 150, 255)
+
+        # Actualizar estado
+        if self.state:
+            self.state.update(is_attentive)
+            stats = self.state.get_stats()
+            atencion_index = stats['attention_index']
+        else:
+            atencion_index = 0
+
+        # Anotaciones visuales
+        cv2.putText(img, texto, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 2)
+        cv2.putText(img, f"Atencion: {atencion_index}%", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+        # Máscara de segmentación
+        if self.ver_mascara_segmentacion and self.usar_segmentacion:
+            img = aplicar_mascara_segmentacion(img, segment.segmentation_mask)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
 # ---------- UI ----------
-st.title("🎯 Monitor de Atención Visual en Tiempo Real")
+st.title("Monitor de Atención Visual en Tiempo Real")
 st.markdown("""
 Este programa utiliza visión por computadora para analizar tu nivel de atención durante una videollamada.
-Evalúa si tu rostro está centrado y si tu mirada se mantiene hacia el frente.  
+Evalúa si tu rostro está centrado y si tu mirada se mantiene hacia el frente.
 Ideal para contextos educativos, de trabajo remoto o validación de presencia.
 
-👁️‍🗨️ A través de la webcam, el sistema detecta si desviás la mirada, girás la cabeza o bajás la vista, y muestra un indicador visual de atención junto a un gráfico en tiempo real.
-### Instrucciones:
-1. Asegurate de que tu cámara esté encendida y funcionando.
-2. Ajustá los umbrales de atención en la barra lateral según tu preferencia (lo ideal es dejarlo en 0.4 para giro a la izquierda, 0.6 para giro a la derecha y 0.25 para cabeza baja).
-3. Presioná "Iniciar monitoreo" para comenzar a evaluar tu atención.
-4. Observá el indicador de atención y el gráfico en tiempo real.
-5. Detenelo cuando quieras y revisá el resumen de tu atención.            
-""")
-st.subheader("👉 La premisa es la siguiente 👈")
-st.markdown("Para demostrar tu atención, procurá estar justo en medio de donde te muestra la cámara 😉")
+A través de la webcam, el sistema detecta si desviás la mirada, girás la cabeza o bajás la vista,
+y muestra un indicador visual de atención junto a un gráfico en tiempo real.
 
-########### SIDEBAR ###########
+### Instrucciones:
+1. Permitir el acceso a la cámara cuando el navegador lo solicite.
+2. Ajustar los umbrales de atención en la barra lateral según tu preferencia.
+3. Presionar "START" para comenzar a evaluar tu atención.
+4. Observar el indicador de atención y el gráfico en tiempo real.
+5. Presionar "STOP" cuando quieras detener el monitoreo.
+""")
+st.subheader("La premisa es la siguiente")
+st.markdown("Para demostrar tu atención, procurá estar justo en medio de donde te muestra la cámara")
+
+# ---------- Sidebar ----------
 with st.sidebar:
-    st.subheader("🤓 Umbrales de Atención")
-    
-    # Ajuste de umbrales para evaluar qué se considera “atención”
-    with st.expander("🎛 Ajustes de Umbrales", expanded=False):
+    st.subheader("Umbrales de Atención")
+
+    with st.expander("Ajustes de Umbrales", expanded=False):
         st.markdown("""
         Ajustá la sensibilidad del sistema de atención:
         - **Giro izquierda/derecha**: margen de movimiento horizontal permitido.
         - **Cabeza baja**: inclinación vertical antes de penalizar.
         """)
         umbral_giro_izquierda = st.slider("Giro hacia izquierda", 0.0, 1.0, 0.4, step=0.01)
-        umbral_giro_derecha   = st.slider("Giro hacia derecha",  0.0, 1.0, 0.6, step=0.01)
-        umbral_ojos_y_baja    = st.slider("Cabeza baja",          0.0, 1.0, 0.25, step=0.01)
+        umbral_giro_derecha = st.slider("Giro hacia derecha", 0.0, 1.0, 0.6, step=0.01)
+        umbral_ojos_y_baja = st.slider("Cabeza baja", 0.0, 1.0, 0.25, step=0.01)
 
     st.markdown("---")
-    st.subheader("⚙️ Configuración")
+    st.subheader("Configuración")
 
-    # Opciones de visualización
-    # Opción 1: Mostrar landmarks faciales
-    mostrar_landmarks = st.checkbox("😀 Mostrar landmarks faciales", value=True)
+    mostrar_landmarks = st.checkbox("Mostrar landmarks faciales", value=True)
     st.caption("Visualiza los puntos y líneas sobre tu rostro (FaceMesh).")
 
-    # Opción 2: Activar segmentación semántica
-    usar_segmentacion = st.checkbox("🖼 Activar segmentación semántica", value=True)
-    st.caption("Valida que haya una persona real (no una imagen). Requiere cámara activa.")
+    usar_segmentacion = st.checkbox("Activar segmentación semántica", value=True)
+    st.caption("Valida que haya una persona real (no una imagen).")
 
-    # Opción 3: Ver máscara de segmentación
-    ver_mascara_segmentacion = st.checkbox("👽 Ver máscara de segmentación", value=True)
-    st.caption("Superpone una máscara verde sobre la persona detectada en la imagen. La idea es separar figura de fondo")
+    ver_mascara_segmentacion = st.checkbox("Ver máscara de segmentación", value=True)
+    st.caption("Superpone una máscara verde sobre la persona detectada.")
 
-    # Opción 4: Mostrar resumen de atención
-    mostrar_tabla = st.checkbox("📊 Mostrar resumen de atención al finalizar", value=True)
-    st.caption("Muestra un gráfico y el promedio de atención al detener el monitoreo.")
+    mostrar_grafico = st.checkbox("Mostrar gráfico en tiempo real", value=True)
+    st.caption("Muestra el gráfico de atención mientras monitorea.")
 
-    # Cronómetro de tiempo activo
-    if st.session_state.start_time:
-        elapsed = int(time.time() - st.session_state.start_time)
-        minutes, seconds = divmod(elapsed, 60)
-        st.markdown(f"⏱️ Tiempo de llamada: **{minutes:02d}:{seconds:02d}**")
+    if st.button("Reiniciar estadísticas"):
+        st.session_state.attention_state.reset()
+        st.rerun()
 
-# ---------- Botones ----------
-# Botón para iniciar monitoreo
-if not st.session_state.running:
-    if st.button("▶️ Iniciar monitoreo"):
-        st.session_state.running = True
-        st.session_state.start_time = time.time()
-        st.session_state.total_frames = 0
-        st.session_state.atencion_frames = 0
-        st.session_state.attention_log.clear()
-        st.session_state.ventana_atencion.clear()
-        st.session_state.x_vals.clear()
-else:
-    # Botón para detener monitoreo y liberar la cámara
-    if st.button("🛑 Detener monitoreo"):
-        st.session_state.running = False
-        if st.session_state.cap:
-            st.session_state.cap.release()
-            st.session_state.cap = None
+# ---------- WebRTC Streamer ----------
+def video_processor_factory():
+    processor = AttentionVideoProcessor()
+    processor.state = st.session_state.attention_state
+    processor.umbral_giro_izquierda = umbral_giro_izquierda
+    processor.umbral_giro_derecha = umbral_giro_derecha
+    processor.umbral_ojos_y_baja = umbral_ojos_y_baja
+    processor.mostrar_landmarks = mostrar_landmarks
+    processor.usar_segmentacion = usar_segmentacion
+    processor.ver_mascara_segmentacion = ver_mascara_segmentacion
+    return processor
 
-# ---------- Procesamiento ----------
-if st.session_state.running:
+col1, col2 = st.columns(2)
 
-    if st.session_state.cap is None:
-        with st.spinner("⌛ Cargando modelo y preparando la cámara: va a tomar un minuto"):
-            st.session_state.cap = cv2.VideoCapture(0)
-            st.session_state.face_mesh = mp.solutions.face_mesh.FaceMesh(
-            max_num_faces=1, refine_landmarks=True,
-            min_detection_confidence=0.5, min_tracking_confidence=0.5
-        )
-        st.session_state.segmentador = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
+with col1:
+    ctx = webrtc_streamer(
+        key="attention-monitor",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        video_processor_factory=video_processor_factory,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 
-    col1, col2 = st.columns(2)
-    video_placeholder = col1.empty()
-    grafico_placeholder = col2.empty()
+# ---------- Gráfico en tiempo real ----------
+with col2:
+    if mostrar_grafico:
+        grafico_placeholder = st.empty()
+        stats_placeholder = st.empty()
 
-    while st.session_state.running:
-        ret, frame = st.session_state.cap.read()
-        if not ret:
-            break
+# Actualizar gráfico periódicamente
+if ctx.state.playing and mostrar_grafico:
+    stats = st.session_state.attention_state.get_stats()
 
-        # Procesamiento básico de frame
-        frame = cv2.flip(frame, 1)                           # Espejo horizontal (efecto selfie)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)         # Conversión a RGB para MediaPipe
-        results = st.session_state.face_mesh.process(rgb)    # Detección de rostro
-        segment = st.session_state.segmentador.process(rgb)  # Segmentación de persona
-        h, w, _ = frame.shape
+    if stats['ventana_atencion'] and stats['x_vals']:
+        fig = graficar_atencion(stats['ventana_atencion'], stats['x_vals'])
+        with col2:
+            grafico_placeholder.pyplot(fig)
 
-        # Contador de frames
-        st.session_state.total_frames += 1
-        score = 0
-        hay_persona = True
-
-        # Validación de persona real (evita fotos)
-        if usar_segmentacion:
-            hay_persona = detectar_presencia_persona(segment.segmentation_mask)
-
-        # Si se detecta rostro y persona válida...
-        if hay_persona and results.multi_face_landmarks:
-            for rostro in results.multi_face_landmarks:
-                if mostrar_landmarks:
-                    frame = dibujar_landmarks(frame, rostro)
-                score, _ = evaluar_atencion(
-                    rostro, w, h,
-                    umbral_giro_izquierda, umbral_giro_derecha, umbral_ojos_y_baja
-                )
-
-            # Clasificación visual según atención
-            if score >= 0.7:
-                st.session_state.atencion_frames += 1
-                texto = "ATENTO"
-                color = (0, 255, 0)
-            else:
-                texto = "NO ATENTO"
-                color = (0, 0, 255)
-        else:
-            texto = "Sin rostro o sin persona"
-            color = (150, 150, 255)
-
-        # Cálculo del índice de atención y actualización de buffers
-        atencion_index = int((st.session_state.atencion_frames / st.session_state.total_frames) * 100)
-        st.session_state.ventana_atencion.append(atencion_index)
-        st.session_state.x_vals.append(st.session_state.total_frames)
-        st.session_state.attention_log.append(atencion_index)
-
-        # Anotaciones visuales en el frame
-        cv2.putText(frame, texto, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 2)
-        cv2.putText(frame, f"Atención: {atencion_index}%", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-        # Aplicación de máscara de segmentación si está activada
-        if ver_mascara_segmentacion and usar_segmentacion:
-            frame = aplicar_mascara_segmentacion(frame, segment.segmentation_mask)
-
-        # Mostrar frame y gráfico
-        video_placeholder.image(frame, channels="BGR")
-        fig = graficar_atencion(st.session_state.ventana_atencion, st.session_state.x_vals)
-        grafico_placeholder.pyplot(fig)
-
-        # Actualización lateral del promedio cada 30 segundos
-        elapsed = int(time.time() - st.session_state.start_time)
-        if elapsed - st.session_state.last_report_time >= 30:
-            ultimos_30 = st.session_state.attention_log[-30:]
-            if ultimos_30:
-                promedio = sum(ultimos_30) / len(ultimos_30)
-                st.sidebar.info(f"🧠 Atención últimos 30s: **{promedio:.1f}%**")
-            st.session_state.last_report_time = elapsed
-
-        time.sleep(0.03)  # Espera corta para no saturar CPU
-
+        # Mostrar estadísticas
+        with col2:
+            if stats['start_time']:
+                elapsed = int(time.time() - stats['start_time'])
+                minutes, seconds = divmod(elapsed, 60)
+                stats_placeholder.markdown(f"""
+                **Estadísticas actuales:**
+                - Tiempo: {minutes:02d}:{seconds:02d}
+                - Frames procesados: {stats['total_frames']}
+                - Atención promedio: {stats['attention_index']}%
+                """)
 
 # ---------- Resumen final ----------
-# Muestra gráfico final y promedio cuando se detiene el monitoreo
-if not st.session_state.running and st.session_state.attention_log and mostrar_tabla:
-    st.subheader("📋 Resumen de atención")
-    promedio_total = sum(st.session_state.attention_log) / len(st.session_state.attention_log)
-    st.markdown(f"🧠 Promedio total: **{promedio_total:.2f}%**")
-    fig_final = graficar_atencion(st.session_state.ventana_atencion, st.session_state.x_vals)
-    st.pyplot(fig_final)
+if not ctx.state.playing:
+    stats = st.session_state.attention_state.get_stats()
+    if stats['attention_log']:
+        st.subheader("Resumen de atención")
+        promedio_total = sum(stats['attention_log']) / len(stats['attention_log'])
+        st.markdown(f"Promedio total: **{promedio_total:.2f}%**")
+
+        if stats['ventana_atencion'] and stats['x_vals']:
+            fig_final = graficar_atencion(stats['ventana_atencion'], stats['x_vals'])
+            st.pyplot(fig_final)
 
 # ---------- Footer fijo ----------
 st.markdown(
@@ -222,7 +292,7 @@ st.markdown(
         }
     </style>
     <div class="footer">
-        Desarrollado por <strong>Nicolás Bargioni</strong> | Año 2025 | ISSD: Inteligencia Artificial y Ciencia de Datos 🧠
+        Desarrollado por <strong>Nicolás Bargioni</strong> | Año 2025 | ISSD: Inteligencia Artificial y Ciencia de Datos
     </div>
     """,
     unsafe_allow_html=True
